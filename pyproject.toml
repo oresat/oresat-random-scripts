@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oresat-random-scripts"
+version = "0.1"
+dependencies = [
+  "oresat-configs==0.7.2",
+  "requests"
+]
+
+[tool.setuptools]
+# We don't want to build a real package from the scripts (yet)
+packages=[]

@@ -7,7 +7,7 @@ from time import sleep
 
 import canopen
 import requests
-from oresat_configs import OreSatConfig, OreSatId
+from oresat_configs import OreSatConfig, Consts
 
 OUT_FILE = "beacons.csv"
 SAT_ID = "DKCD-1609-0567-7056-3922"  # OreSat0.5
@@ -29,7 +29,7 @@ DATA_TYPE_SIZE = {
     canopen.objectdictionary.datatypes.UNSIGNED64: 8,
 }
 
-beacon_def = OreSatConfig(OreSatId.ORESAT0_5).beacon_def
+beacon_def = OreSatConfig(Consts.ORESAT0_5).beacon_def
 
 data = []
 
