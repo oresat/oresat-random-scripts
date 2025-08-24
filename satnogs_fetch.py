@@ -1,116 +1,145 @@
 #!/usr/bin/env python3
-"""Quick script to fetch all data from satnogs db."""
+"""Script to fetch all data from satnogs db."""
 
-import zlib
+import csv
+import re
+from zlib import crc32
 from argparse import ArgumentParser
 from time import sleep
+from typing import Any
 
-import canopen
 import requests
+
 from oresat_configs import OreSatConfig, Mission
 
-OUT_FILE = "beacons.csv"
-SAT_ID = "DKCD-1609-0567-7056-3922"  # OreSat0.5
-URL = (
-    f"https://db.satnogs.org/api/telemetry/?format=json&is_decoded=true&sat_id={SAT_ID}"
-)
 
-DATA_TYPE_SIZE = {
-    canopen.objectdictionary.datatypes.BOOLEAN: 1,
-    canopen.objectdictionary.datatypes.INTEGER8: 1,
-    canopen.objectdictionary.datatypes.INTEGER16: 2,
-    canopen.objectdictionary.datatypes.INTEGER32: 4,
-    canopen.objectdictionary.datatypes.UNSIGNED8: 1,
-    canopen.objectdictionary.datatypes.UNSIGNED16: 2,
-    canopen.objectdictionary.datatypes.UNSIGNED32: 4,
-    canopen.objectdictionary.datatypes.REAL32: 4,
-    canopen.objectdictionary.datatypes.REAL64: 8,
-    canopen.objectdictionary.datatypes.INTEGER64: 8,
-    canopen.objectdictionary.datatypes.UNSIGNED64: 8,
-}
+def get_data(data: list[dict[str, Any]], token: str, satellite: str) -> None:
+    response = requests.get(
+        'https://db.satnogs.org/api/telemetry/',
+        headers={"Authorization": f"Token {token}"},
+        params={
+            'format': 'json',
+            'is_decoded': 'true',
+            'satellite': satellite,
+        },
+    )
+    while True:
+        if response.status_code == requests.codes.OK:
+            content = response.json()
+            results = content['results']
+            data.extend(results)
+            print(
+                f'Retrieved {len(results):2} telemetry packets ({len(data):5} total), '
+                f'from {results[0]["timestamp"]} to {results[-1]["timestamp"]}'
+            )
+            cursor = content['next']
+            if cursor is None:
+                break
+        elif response.status_code == requests.codes.TOO_MANY_REQUESTS:
+            detail = response.json()['detail']
+            print(detail)
+            m = re.fullmatch(
+                r'Request was throttled. Expected available in (?P<time>\d+) seconds.', detail
+            )
+            if m is None:
+                print('Unexpected response')
+                break
+            sleep(int(m['time']))
+        else:
+            print('Unexpected SatNOGS DB response:', response)
+            print(response.json())
+            break
+        # Not documented as far as I can find but looking at the SatNOGS DB source we are limited
+        # to 6/minute requests. We could burst and then hit the throttle response but this seems
+        # more polite?
+        sleep(10)
+        response = requests.get(
+            cursor,
+            headers={"Authorization": f"Token {token}"},
+        )
 
-beacon_def = OreSatConfig(Mission.ORESAT0_5).beacon_def
 
-data = []
+def parse_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    beacon_def = OreSatConfig(Mission.ORESAT0_5).beacon_def
+    beacons = []
+    for r in data:
+        packet = {
+            'timestamp': r['timestamp'],
+            'observation_id': r['observation_id'],
+            'observer': r['observer'],
+            'station_id': r['station_id'],
+            'app_source': r['app_source'],
+        }
+        msg = bytes.fromhex(r['frame'])
+        body = msg[16:-4]  # ax.25 header : body : crc
+        crc = int.from_bytes(msg[-4:], 'little')
 
-
-def get_data(url: str, token: str):
-    response = requests.get(url, headers={"Authorization": f"Token {token}"})
-    r_json = response.json()
-    if response.status_code == 401:
-        print(r_json["detail"])
-        return
-
-    if "results" not in r_json:
-        print(r_json["detail"], "\n")
-        tmp = r_json["detail"].split(" ")
-        sleep(int(tmp[-2]) + 1)
-        return get_data(url, token)
-
-    for r in r_json["results"]:
-        row = f'{r["timestamp"]},{r["observation_id"]},{r["observer"]},'
-        row += f'{r["station_id"]},{r["app_source"]},'
-        frame = r["frame"]
-        msg = bytes.fromhex(frame)
-
-        crc32_calc = zlib.crc32(msg[16:-4], 0).to_bytes(4, "little")
-        if crc32_calc != msg[-4:]:
-            print("invalid crc32\n")
+        if crc32(body, 0) != crc:
+            print(f"Packet in obseration {r['observation_id']} ({r['timestamp']}) has invalid CRC")
             continue
 
-        offset = 16  # skip ax25 header
+        offset = 0
         for obj in beacon_def:
-            size = DATA_TYPE_SIZE.get(obj.data_type, 0)
-            if size == 0:
+            try:
+                size = obj.STRUCT_TYPES[obj.data_type].size
+            except KeyError:
+                # For strings and the like
                 size = len(obj.value)
-            value = obj.decode_raw(msg[offset : offset + size])
-            if obj.bit_definitions:
-                for i in obj.bit_definitions.values():
-                    row += f"{bool(value & (1 << i))},"
-            else:
-                value = obj.value_descriptions.get(value, value)
-                row += f"{value},"
+            value = obj.decode_raw(body[offset : offset + size])
             offset += size
-        row += f'{int.from_bytes(msg[-4:], "little")}\n'
-        print(len(data) + 1, row)
-        data.append(row)
 
-    sleep(0.2)  # don't abuse the api
-    if r_json["next"]:
-        get_data(r_json["next"], token)
+            name = obj.name
+            if hasattr(obj.parent, 'name'):
+                name = f"{obj.parent.name}_{name}"
 
-
-def main():
-    parser = ArgumentParser(
-        "download all beacon data from satnogs, decode it, and save it to a csv"
-    )
-    parser.add_argument("token", help="satnogs db api token")
-    args = parser.parse_args()
-
-    try:
-        get_data(URL, args.token)
-    except KeyboardInterrupt:
-        pass
-
-    header = "timestamp,observation_id,observer,station_id,app_source,"
-    for obj in beacon_def:
-        name = obj.name
-        if not isinstance(obj.parent, canopen.ObjectDictionary):
-            name = f"{obj.parent.name}_{name}"
-        if obj.bit_definitions:
-            for v in obj.bit_definitions.keys():
-                header += f"{obj.name}_{v.lower()},"
-        else:
-            if obj.unit:
-                name += f" ({obj.unit})"
-            header += f"{name},"
-    header += "crc32\n"
-
-    lines = [header] + list(reversed(data))
-
-    with open(OUT_FILE, "w") as f:
-        f.writelines(lines)
+            if obj.bit_definitions:
+                for k, bits in obj.bit_definitions.items():
+                    packet[f'{name}_{k.lower()}'] = bool(value & (1 << bits[0]))
+            else:
+                if obj.unit:
+                    name += f' ({obj.unit})'
+                value = obj.value_descriptions.get(value, value)
+                packet[name] = value
+        packet['crc32'] = crc
+        beacons.append(packet)
+    return beacons
 
 
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser(
+        description=(
+            "Download all beacon data from SatNOGS, decode it, and save it to a csv. "
+            "Due to rate limits beacons are fetched at 150/minute"
+        ),
+        epilog="Ctrl+c during beacon download will write out beacons fetched to that point",
+    )
+    parser.add_argument(
+        "token",
+        help=(
+            "Your personal SatNOGS DB API token. Find your token by creating an account at "
+            "db.satnogs.org"
+        ),
+    )
+    parser.add_argument(
+        "-f", "--file", help="CSV file name. Default '%(default)s'", default="beacons.csv"
+    )
+    parser.add_argument(
+        "-s",
+        "--satellite",
+        help="Satellite NORAD ID. Default %(default)s (OreSat0.5)",
+        default=60525,
+    )
+    args = parser.parse_args()
+
+    data: list[dict[str, Any]] = []
+    try:
+        get_data(data, args.token, args.satellite)
+    except KeyboardInterrupt:
+        pass
+    beacons = parse_data(data)
+
+    with open(args.file, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=beacons[0].keys())
+        writer.writeheader()
+        for beacon in beacons:
+            writer.writerow(beacon)
