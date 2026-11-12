@@ -1,0 +1,3 @@
+labjack-ljm
+pandas
+matplotlib
